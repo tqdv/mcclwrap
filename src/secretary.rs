@@ -1,7 +1,7 @@
-// Functions that handle incoming connection and commands on the socket
+//! Functions that handle incoming connection and commands on the socket
 
-/* Socket language: 
-
+/*! Socket language:
+```text
 ready → wait for server ready
 	=> ok: ready → server ready
 	=> error: ready unknown → (rare) can't tell if server is ready
@@ -15,31 +15,46 @@ get-line =#<regex>#= <cmd> → run command and wait for line that matches regex
 	=> error: get-line server server stopped handling commands → (rare)
 cya → close this connection
 	=> cya o/ → we are indeed closing
+```
 */
 use crate::slang::*;
 
 use crate::ready;
-use tokio::sync::oneshot;
 
-use crate::minecraft::{
-	SharedOutputFilters, SharedInputFilters,
-	OutputFilter, OurInputFilter, InputFilter,
-	action_once
-};
+use crate::filters::{self, OutputFilter, OurInputFilter};
+use crate::minecraft::{ClientRequest, ClientCommand, ConsoleCommandKind};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::{UnixStream, UnixListener};
 use regex::RegexBuilder;
 
-pub(crate) struct Client {
-	rx_ready :ready::Receiver,
-	tx_req :mpsc::Sender<String>,
-	output_filters :SharedOutputFilters,
-	input_filters :SharedInputFilters,
-	current_guard :Option<OurInputFilter>,
-	id :u32,
+// === Functions ===
+
+//noinspection ALL,Annotator
+/// Entry point for socket listening
+pub(crate) fn listen_on_socket (
+	mut listener :UnixListener, rx_ready :ready::Receiver,
+	tx_req :mpsc::Sender<ClientRequest>)
+	-> tokio::task::JoinHandle<()>
+{
+	tokio::spawn(async move {
+		let mut incoming = listener.incoming();
+
+		while let Some(Ok(stream)) = incoming.next().await {
+			let client = Client::new(rx_ready, tx_req);
+			tokio::spawn(client.process(stream));
+		}
+	})
 }
 
-type ClientAnswer = Result<String, String>;
+/// Returns a new client id. This _can_ overflow (after 2**32)
+pub(crate) /* FIXME */ fn get_client_id () -> u32 {
+	static COUNTER :AtomicU32 = AtomicU32::new(0);
+	// Starts at 1 because 0 is reserved for internal clients
+	COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
+// Parsing regexes
 lazy_static! {
 	// eg. get-line /There are .* players online:/ list
 	static ref GET_LINE_REGEX :Regex = Regex::new(r"(?x)
@@ -58,38 +73,78 @@ lazy_static! {
 		[\ \t]* $").unwrap();
 }
 
+// === Data types ===
+
+pub(crate) struct Client {
+	// Server channels
+	rx_ready :ready::Receiver, // Minecraft server is ready
+	tx_req :mpsc::Sender<ClientRequest>, // Send a request to the minecraft handler
+
+	// Filter output
+	rx_filter :mpsc::Receiver<FilterOutput>,
+
+	// Client state
+	id :u32,
+	request_id_generator :AtomicU32,
+}
+
+/// Err means dropping the connection because of unrecoverable failures cf. Client::reply_*
+type ClientAnswer = Result<String, String>;
+
 impl Client {
-	async fn process (mut self, mut stream :UnixStream) {
-		let (reader, mut writer) = stream.split();
-		let mut lines = BufReader::new(reader).lines();
-		let mut should_break;
-
-		while let Some(l) = lines.next().await {
-			let l = l.expect("Some IO or utf error probably");
-			println!("{}⬅️  {}", self.id, l);
-
-			let reply = self.process_line(&l).await;
-			should_break = reply.is_err();
-			let mut reply = reply.into_inner();
-
-			if !reply.ends_with("\n") {
-				reply.push_str("\n");
-			}
-
-			print!("{}➡️  {}", self.id, reply);
-			if let Err(_) = writer.write_all(reply.as_bytes()).await {
-				// CHECKME stop handling client on first write error
-				should_break = true;
-			}
-
-			if should_break {
-				break;
-			}
+	/// Constructor. Pass it the server ready channel and the request sender channel
+	fn new (rx_ready :ready::Receiver, tx_req :mpsc::Sender<ClientRequest>) -> Self {
+		Self {
+			rx_ready,
+			tx_req,
+			id: get_client_id(),
+			request_id_generator: AtomicU32::new(0),
 		}
 	}
 
-	async fn process_line(&mut self, line :&str) -> ClientAnswer {
-		let (command, rest) = match line.find(&[' ', '\t'] as &[_]){
+	// {{{ Process a stream
+	// NB: we are in tokio context so tokio::spawn is valid
+
+	/// Entry point when processing socket connections
+	async fn process (mut self, mut stream :UnixStream) {
+		let (reader, mut writer) = stream.split();
+		let mut lines = BufReader::new(reader).lines();
+		let mut close_connection = false;
+
+		// Listen to filter output on another task
+		tokio::spawn(async move {
+			while Some(m) = self.rx_filter.recv() {
+				unimplemented!();
+			}
+		});
+
+		while let Some(l) = lines.next().await {
+			let l = l.expect("Some IO or utf error probably"); // FIXME
+			println!("{}⬅️  {}", self.id, l);
+
+			let reply = self.process_command(&l).await;
+			if reply.is_err() { close_connection = true; }
+
+			let reply = { // Get string with newline
+				let mut s = reply.into_inner();
+				s.now_ends_with("\n");
+				s
+			};
+
+			print!("{}➡️  {}", self.id, reply);
+
+			let write_result = writer.write_all(reply.as_bytes()).await;
+			// CHECK stop handling client on first write error
+			if write_result.is_err() { close_connection = true; }
+
+			if close_connection { break; }
+		}
+	}
+
+	/// Handles a single command
+	async fn process_command(&mut self, line :&str) -> ClientAnswer {
+		// Extract the first whitespace-delimited word
+		let (command, rest) = match line.find(util::ASCII_WS){
 			Some(i) => (&line[..i], &line[i+1..]),
 			None => (line, ""),
 		};
@@ -97,307 +152,182 @@ impl Client {
 		match command {
 			"ready" => {
 				match (&mut self.rx_ready).await {
-					Some(_) => Ok("ok: ready".to_string()),
-					None => Err("error: ready unknown".to_string()),
+					Some(_) => Self::reply_ok(command, ":)"),
+					None => Self::reply_bail(command, "unknown"),
 				}
 			},
 			"slash" => {
-				let sending_command = (&mut self.tx_req)
-					.send(rest.trim_start_matches(&[' ', '\t'] as &[_]).to_string());
-				match sending_command.await {
-					Ok(_) => Ok("ok: slash".to_string()),
-					Err(_) => Err("error: slash server stopped handling commands".to_string()),
-				}
+				// Send request
+				let slash = util::strip_leading_ascii_hspace(rest).to_string();
+				tear! { self.send_request(command,
+					ClientCommand::ConsoleCommand{ slash, kind: ConsoleCommandKind::Slash }
+				).await };
+
+				// slash command has been run
+				Self::reply_ok(command, ":)")
 			},
 			"get-line" => self.get_line(rest).await,
-			"cya" => Err("cya o/".to_string()),
 			"guard" => self.guard_command(rest).await,
+			"cya" => Err("ok: cya, o/".to_string()),
 			// otherwise
-			x => Ok(format!("error: unknown command {}", x)),
+			x => Self::reply_err(x, "unknown command"),
 		}
 	}
 
 	async fn get_line (&mut self, rest :&str) -> ClientAnswer {
+		const COMMAND:&str = "get-line";
+
 		// Parse line
 		let (regex, slash) = match GET_LINE_REGEX.captures(rest) {
 			Some(cap) => (cap.get(1).unwrap().as_str(), cap[2].to_string()),
-			None => return Ok("error: get-line bad arguments".to_string()),
+			None => return Self::reply_err(COMMAND, "bad arguments"),
 		};
 		// Compile regex
 		let regex = tear! { RegexBuilder::new(regex).size_limit(1 << 20).build()
-			=> |_| Ok("error: get-line invalid or expensive regex".to_string())
-		};
+			=> |_| Self::reply_err(COMMAND, "invalid or expensive regex") };
 
-		// Prepare callback
-		let (tx, rx) = oneshot::channel::<String>();
-		let filter = OutputFilter {
-			regex,
-			action: action_once(move |msg :&str| {
-				let _ = tx.send(msg.to_string()); // ignore if sender dropped
-			}),
-			count: Cell::new(1),
-			fail: Some(Cell::new(64)),
-		};
+		// Prepare filter
+		let (filter, mut rx_line) = OutputFilter::new(regex)
+			.count(Some(1))
+			.fail(Some(64))
+			.build();
+		// TODO channel custom capacity
 
-		{
-			// LOCK register output parser
-			let mut output_filters = self.output_filters.lock().unwrap();
-			output_filters.push(filter);
-		}
+		// Send request
+		tear! { self.send_request(COMMAND,
+			ClientCommand::ConsoleCommand { slash, kind: ConsoleCommandKind::GetLine(filter) }
+		).await };
 
-		// Send command
-		if let Err(_) = self.tx_req.send(slash).await {
-			return Err("error: get-line server stopped handling commands".to_string());
-		}
+		// Wait for result
+		let r = tear! { rx_line.recv().await => |_| Self::reply_err(COMMAND, "line not found") };
 
-		// Wait for callback
-		let r :String = tear! { rx.await => |_| Err("error: get-line line not found".to_string())};
-
-		Ok(format!("ok: get-line, {}", r))
+		Self::reply_ok(COMMAND, &r)
 	}
 
 	async fn guard_command (&mut self, rest :&str) -> ClientAnswer {
 		let (subcommand, rest) = match GUARD_SUBCMD_REGEX.captures(rest) {
 			Some(cap) => (cap.get(1).unwrap().as_str(), cap.get(2).unwrap().as_str()),
-			None => return Ok("error: guard missing subcommand".to_string()),
+			None => return Self::reply_err("guard", "missing subcommand"),
 		};
 		match subcommand {
 			"prevent" => {
+				const COMMAND :&str = "guard prevent";
+
 				// Parse arguments
 				let regex = match GUARD_PREVENT_REGEX.captures(rest) {
 					Some(cap) => cap.get(2).unwrap().as_str(),
-					None => return Ok("error: guard prevent, bad argument".to_string()),
+					None => return Self::reply_ok(COMMAND, "bad argument"),
 				};
 				// Compile regex
 				let regex = tear! { RegexBuilder::new(regex).size_limit(1 << 20).build()
-					=> |_| Ok("error: guard prevent, invalid or expensive regex".to_string())
-				};
+					=> |_| Self::reply_ok(COMMAND, "invalid or expensive regex") };
 
 				// Prepare input filter
-				let filter = OurInputFilter(Arc::new(InputFilter{
-					regex, time: crate::GUARD_TIMEOUT, client_id: self.id,
+				let filter = OurInputFilter(Arc::new(filters::InputFilter{
+					regex, client_id: self.id,
 				}));
+				let filter_id = Self::new_request_id();
 
-				{
-					// LOCK add filter to set and keep a copy
-					let mut input_filters = self.input_filters.lock().unwrap();
+				// Create request
+				let (request, rx_done) = self.new_request(ClientCommand::StartGuard(filter));
 
-					self.current_guard = Some(filter.clone());
-					input_filters.insert(filter);
+				// Insert it first into the active requests
+				self.input_filters.insert() // FIXME
+
+				// Send the request
+				if let Err(_) = self.tx_req.send(request).await {
+					return Self::reply_err(COMMAND, "server stopped handling commands");
 				}
 
-				Ok("ok: guard prevent".to_string())
+				// Wait for confirmation
+				if let None = rx_done.await {
+					return Self::reply_err(COMMAND, "command was not handled");
+				}
+
+				unimplemented!();
+
+
+
+				Self::reply_ok(COMMAND, filter_id.to_string)
 			}
 			"renew" => {
-				// TODO reset timer
-				if let None = self.current_guard {
-					return Ok("error: guard renew, no guard".to_string());
+				const COMMAND :&str = "guard renew";
+
+				if let Some(Some(filter)) = self.current_guard.as_ref().map(|v| std::sync::Weak::upgrade(v)) {
+					tear! { self.send_request(COMMAND,
+						ClientCommand::RenewGuard(OurInputFilter(filter))
+					).await }
+
+					Self::reply_ok(COMMAND, "done")
+				} else {
+					Self::reply_err(COMMAND, "no such guard")
 				}
-
-				{
-					// LOCK update filter
-					self.input_filters.lock().unwrap();
-
-
-				}
-				unimplemented!()
 			},
 			"done" => {
 				// TODO remove guard
+				if let None = self.current_guard {
+					return Ok("error: guard done, no active guard".to_string());
+				}
+
 				unimplemented!()
 			},
 			x => Ok(format!("error: guard unknown subcommand {}", x)),
 		}
 	}
-}
 
-// impl Drop for Client {
-// 	// TODO Drop our guard
-// }
+	// }}}
 
-fn get_id () -> u32 {
-	use std::sync::atomic::{AtomicU32, Ordering};
-	
-	static COUNTER :AtomicU32 = AtomicU32::new(0);
-	COUNTER.fetch_add(1, Ordering::Relaxed)
-}
+	// {{{ Utility functions
 
-// Entry point
-pub(crate) fn listen_on_socket (
-	mut listener :UnixListener, rx_ready :ready::Receiver,
-	tx_req :mpsc::Sender<String>,
-	output_filters :SharedOutputFilters,
-	input_filters :SharedInputFilters)
-	-> tokio::task::JoinHandle<()>
-{
-	tokio::spawn(async move {
-		let mut incoming = listener.incoming();
-		
-		while let Some(Ok(stream)) = incoming.next().await {
-			let client = Client {
-				rx_ready: rx_ready.clone(),
-				tx_req: tx_req.clone(),
-				output_filters: output_filters.clone(),
-				input_filters: input_filters.clone(),
-				current_guard :None,
-				id: get_id(),
-			};
-			tokio::spawn(client.process(stream));
-			// tokio::spawn(process_client(
-			// 	stream, rx_ready.clone(), tx_req.clone(), output_filters.clone()
-			// ));
+	/// Gets a new request id. This _can_ overflow (after 2**32 requests)
+	fn new_request_id (&mut self) -> u32 {
+		self.request_id_generator.fetch_add(1, Ordering::Relaxed)
+	}
+
+	/// Given a command, creates a new request and its ready receiver
+	fn new_request (&self, command :ClientCommand) -> (ClientRequest, ready::Receiver) {
+		let (tx, rx) = ready::channel();
+		let request = ClientRequest {
+			done: tx,
+			command,
+			client_id: self.id,
+		};
+		(request, rx)
+	}
+
+	/// Common boilerplate for sending a request and making sure it has been processed
+	async fn send_request (&mut self, name :&str, command :ClientCommand)
+	-> tear::ValRet<(), ClientAnswer>
+	{
+		let (request, rx_done) = self.new_request(command);
+
+		// Send the request
+		if let Err(_) = self.tx_req.send(request).await {
+			ret!{ Self::reply_err(name, "server stopped handling commands") };
 		}
-	})
+
+		// Wait for confirmation
+		if let None = rx_done.await {
+			ret!{ Self::reply_err(name, "command was not handled") };
+		}
+
+		Val(())
+	}
+
+	/// Formatted ok client answer
+	fn reply_ok (command :&str, msg :&str) -> ClientAnswer {
+		Ok(format!("ok: {}, {}", command, msg))
+	}
+
+	/// Formatted err client answer
+	fn reply_err (command :&str, msg :&str) -> ClientAnswer {
+		Ok(format!("error: {}, {}", command, msg))
+	}
+
+	/// Formatted bail client answer (drops the client)
+	fn reply_bail (command :&str, msg :&str) -> ClientAnswer {
+		Err(format!("bail: {}, {}", command, msg))
+	}
+
+	// }}}
 }
-
-// async fn process_client (
-// 	mut stream :UnixStream,
-// 	mut rx_ready :ready::Receiver,
-// 	mut tx_req :mpsc::Sender<String>,
-// 	output_filters :SharedOutputFilters,
-// ) {
-// 	let id = get_id();
-// 	let (reader, mut writer) = stream.split();
-// 	let mut lines = BufReader::new(reader).lines();
-// 	let mut should_break;
-//
-// 	while let Some(l) = lines.next().await {
-// 		let l = l.expect("Some IO or utf error probably");
-// 		println!("{}⬅️  {}", id, l);
-//
-// 		let reply = process_line(l, &mut rx_ready, &mut tx_req, &output_filters).await;
-// 		should_break = reply.is_err();
-// 		let mut reply = reply.into_inner();
-//
-// 		if !reply.ends_with("\n") {
-// 			reply.push_str("\n");
-// 		}
-//
-// 		print!("{}➡️  {}", id, reply);
-// 		if let Err(_) = writer.write_all(reply.as_bytes()).await {
-// 			// CHECKME stop handling client on first write error
-// 			should_break = true;
-// 		}
-//
-// 		if should_break {
-// 			break;
-// 		}
-// 	}
-// }
-
-// async fn process_line (
-// 	line :String,
-// 	rx_ready :&mut ready::Receiver,
-// 	tx_req :&mut mpsc::Sender<String>,
-// 	output_filters :&SharedOutputFilters)
-// 	-> Result<String, String>
-// {
-// 	let (command, rest) = match line.find(|c| c == ' ' || c == '\t'){
-// 		Some(i) => (&line[..i], &line[i+1..]),
-// 		None => (line.as_str(), ""),
-// 	};
-//
-// 	match command {
-// 		"ready" => {
-// 			match rx_ready.await {
-// 				Some(_) => Ok("ready ok".to_string()),
-// 				None => Err("error: ready unknown".to_string()),
-// 			}
-// 		},
-// 		"slash" => {
-// 			match tx_req.send(rest.to_string()).await {
-// 				Ok(_) => Ok("slash ok".to_string()),
-// 				Err(_) => Err("error: slash server stopped handling commands".to_string()),
-// 			}
-// 		},
-// 		"get-line" => get_line(rest, output_filters, tx_req).await,
-// 		"cya" => Err("cya o/".to_string()),
-// 		"guard" => guard_command(rest, tx_req).await,
-// 		// otherwise
-// 		x => Ok(format!("error: unknown command {}", x)),
-// 	}
-// }
-//
-// async fn get_line (
-// 	rest :&str,
-// 	output_filters :&SharedOutputFilters,
-// 	tx_req :&mut mpsc::Sender<String>)
-// 	-> Result<String, String>
-// {
-// 	// Parse line
-// 	let (regex, slash) = match GET_LINE_REGEX.captures(rest) {
-// 		Some(cap) => (cap.get(1).unwrap().as_str(), cap[2].to_string()),
-// 		None => return Ok("error: get-line bad arguments".to_string()),
-// 	};
-// 	// Compile regex
-// 	let regex = match RegexBuilder::new(regex).size_limit(1 << 20).build() {
-// 		Ok(v) => v,
-// 		Err(_) => return Ok("error: get-line invalid or expensive regex".to_string()),
-// 	};
-//
-// 	// Prepare callback
-// 	let (tx, rx) = oneshot::channel::<String>();
-// 	let filter = OutputFilter {
-// 		regex,
-// 		action: action_once(move |msg :&str| {
-// 			let _ = tx.send(msg.to_string()); // ignore if sender dropped
-// 		}),
-// 		count: Cell::new(1),
-// 		fail: Some(Cell::new(64)),
-// 	};
-//
-// 	{
-// 		// LOCK register output parser
-// 		let mut output_filters = output_filters.lock().unwrap();
-// 		output_filters.push(filter);
-// 	}
-//
-// 	// Send command
-// 	if let Err(_) = tx_req.send(slash).await {
-// 		return Err("error: get-line server stopped handling commands".to_string());
-// 	}
-//
-// 	// Wait for callback
-// 	let r :String = tear! { rx.await => |_| Err("error: get-line line not found".to_string())};
-//
-// 	Ok(format!("get-line ok {}", r))
-// }
-//
-// async fn guard_command (rest :&str, tx_req :&mut mpsc::Sender<String>) -> Result<String, String> {
-// 	let (subcommand, rest) = match GUARD_SUBCMD_REGEX.captures(rest) {
-// 		Some(cap) => (cap.get(1).unwrap().as_str(), cap.get(2).unwrap().as_str()),
-// 		None => return Ok("error: guard missing subcommand".to_string()),
-// 	};
-// 	match subcommand {
-// 		"prevent" => {
-// 			// Parse arguments
-// 			let (time, regex) = match GUARD_PREVENT_REGEX.captures(rest) {
-// 				Some(cap) => (cap.name("time").map(|v| v.as_str()), cap.get(2).unwrap().as_str()),
-// 				None => return Ok("error: guard prevent, bad argument".to_string()),
-// 			};
-// 			// Compile regex
-// 			let regex = match RegexBuilder::new(regex).size_limit(1 << 20).build() {
-// 				Ok(v) => v,
-// 				Err(_) => return Ok("error: guard prevent, invalid or expensive regex".to_string()),
-// 			};
-//
-// 			// Prepare input filter
-// 			let filter = OurInputFilter (Arc::new(InputFilter{
-// 				regex,
-// 				time: Duration::from_secs(30), // FIXME
-// 				client_id: 0, // FIXME
-// 			}));
-//
-// 			unimplemented!()
-// 		}
-// 		"renew" => {
-// 			// TODO reset timer
-// 			unimplemented!()
-// 		},
-// 		"done" => {
-// 			// TODO remove guard
-// 			unimplemented!()
-// 		},
-// 		x => Ok(format!("error: guard unknown subcommand {}", x)),
-// 	}
-// }

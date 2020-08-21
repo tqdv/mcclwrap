@@ -14,6 +14,12 @@ pub(crate) fn sigkill_process (pid :Pid) -> nix::Result<()> {
 	kill(pid, Signal::SIGKILL)
 }
 
+pub(crate) const ASCII_WS :&[char] = &[' ', '\t'];
+
+pub(crate) fn strip_leading_ascii_hspace(s :&str) -> &str {
+	s.trim_start_matches(&[' ', '\t'] as &[_])
+}
+
 // lazy_static! {
 // 	static ref COLOR_REGEX :Regex = Regex::new(r"(?x)
 // 		\x1B .*? m").unwrap();

@@ -1,98 +1,17 @@
 //! Handle minecraft process and console
 use crate::slang::*;
+use tokio::select;
 
-use crate::ready;
+use crate::{ready, util};
 use tokio::sync::broadcast;
 
-use std::collections::HashSet;
+use crate::filters::{OurInputFilter, OutputFilter, SharedOutputFilters};
+use std::pin::Pin;
+use std::collections::HashMap;
 use tokio::process::{Command, Child, ChildStdin, ChildStdout};
-use tokio::time::Duration;
+use tokio::time::{DelayQueue, delay_queue};
 
 use std::convert::TryInto as _;
-
-pub(crate) enum FilterCallback {
-	Once(Box<dyn FnOnce(&str) -> () + Send>),
-	Multiple(Box<dyn FnMut(&str) -> () + Send>), // TESTME
-}
-
-pub(crate) struct OutputFilter {
-	pub(crate) regex :Regex,
-	// Cell<Option<T>> lets us take the value out of a borrow
-	pub(crate) action :Cell<Option<FilterCallback>>,
-	// How many lines match the regex
-	pub(crate) count :Cell<i32>,
-	// How many lines are allowed not to match
-	pub(crate) fail :Option<Cell<i32>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct InputFilter {
-	pub(crate) regex :Regex,
-	pub(crate) time :Duration,
-	pub(crate) client_id :u32,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct OurInputFilter (pub(crate) Arc<InputFilter>);
-
-// Wraps the function into the right type for OutputFilter.action that will be called once (FilterCallback::Once)
-pub(crate) fn action_once (f :impl FnOnce(&str) + Send + 'static)
-	-> Cell<Option<FilterCallback>>
-{
-	Cell::new(Some(FilterCallback::Once(Box::new(f))))
-}
-
-// TODO defined fn action_multiple if needed 
-
-pub(crate) type SharedOutputFilters = Arc<Mutex<Vec<OutputFilter>>>;
-pub(crate) type SharedInputFilters = Arc<Mutex<HashSet<OurInputFilter>>>;
-
-// === Implementing traits for {Input,Output}Filter and FilterCallback ===
-
-impl PartialEq for OurInputFilter {
-	fn eq(&self, other :&Self) -> bool {
-		Arc::ptr_eq(&self.0, &other.0) }}
-
-impl Eq for OurInputFilter {}
-
-impl std::hash::Hash for OurInputFilter {
-	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-		(&*self.0 as *const InputFilter).hash(state) }}
-
-impl std::fmt::Debug for FilterCallback {
-	fn fmt(&self, f :&mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			FilterCallback::Once(_) =>
-				f.write_str("FilterCallback::Once(<anon>)"),
-			FilterCallback::Multiple(_) =>
-				f.write_str("FilterCallback::Multiple(<anon>)"), }}}
-
-/// A struct whose debug output is the string it wraps
-struct DebugStr<'a> (&'a str);
-impl std::fmt::Debug for DebugStr<'_> {
-	fn fmt(&self, f :&mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str(self.0) }}
-
-impl std::fmt::Debug for OutputFilter {
-	fn fmt(&self, f :&mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let callback = self.action.take();
-		let action;
-		match callback {
-			Some(callback) => {
-				action = format!("Cell::new(Some({:?}))", callback);
-				self.action.set(Some(callback));
-			},
-			None => action = "Cell::new(None)".to_string(),
-		}
-
-		f.debug_struct("OutputFilter")
-			.field("regex", &self.regex)
-			.field("action", &DebugStr(&action))
-			.field("count", &self.count)
-			.field("fail", &self.fail)
-		 	.finish() }}
-
-// ___ Implementing Debug for OutputFilter and FilterCallback ___
 
 pub(crate) mod error {
 	use thiserror::Error;
@@ -108,6 +27,7 @@ pub(crate) mod error {
 	}	
 }
 
+/// Get the minecraft process and its filehandles
 pub(crate) fn get_minecraft (mc_command :&str, mc_args :&[&str])
 	-> Result<(Child, ChildStdin, ChildStdout, Pid), error::StartMinecraft>
 {
@@ -116,9 +36,7 @@ pub(crate) fn get_minecraft (mc_command :&str, mc_args :&[&str])
 	let mut child = terror! {
 		Command::new(mc_command)
 		.args(mc_args)
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.stdin(Stdio::piped())
+		.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
 		.spawn()
 		=> error::StartMinecraft::Spawn
 	};
@@ -130,76 +48,81 @@ pub(crate) fn get_minecraft (mc_command :&str, mc_args :&[&str])
 	Ok((child, stdin, stdout, pid))
 }
 
-// Spawn a task that runs minecraft in the background
+/// Spawn a task that runs minecraft in the background and return its handle
 pub(crate) fn run_minecraft (mc :Child, mut tx_stop :mpsc::Sender<()>)
 	-> tokio::task::JoinHandle<()>
 {
 	tokio::spawn(async move {
+		// Run server in background
 		if let Err(e) = mc.await {
 			eprintln!("🎁 Server process unexpectedly stopped. {}", e);
 		}
-		// Errors if buffer is full (which is fine), or dropped (which can't be helped)
+
+		// Ignore error which happens if the channel buffer is full (which is fine),
+		// or if the receiver dropped (which can't be helped)
 		let _ = tx_stop.try_send(());
 	})
 }
 
+// Spawn tasks to handle minecraft console output and input requests
 pub(crate) fn handle_minecraft_io <I, O> (input :I, output :O)
-	-> (mpsc::Sender<String>, SharedOutputFilters, SharedInputFilters, ready::Receiver, ready::Receiver)
+	-> (mpsc::Sender<ClientRequest>, SharedOutputFilters, ready::Receiver, ready::Receiver)
 	where
 		I : 'static + Send + Unpin + AsyncWrite,
 		O : 'static + Send + Unpin + AsyncRead,
 {
 	// User commands
-	let (tx_req, rx_req) = mpsc::channel::<String>(64);
-	
+	let (tx_req, rx_req) = mpsc::channel::<ClientRequest>(64);
+
 	// Input filters (for command guards)
-	let input_filters = Arc::new(Mutex::new(HashSet::<OurInputFilter>::new()));
+	let input_filters = Vec::new();
+	// Output filters
+	let (output_filters, rx_mc_ready, rx_mc_close);
+	{ // Initialize output filters with server status filters
+		let mut my_output_filters = Vec::new();
+		let (done_filter, rx_ready) = OutputFilter::new(Regex::new(
+			r"^Done \([^(]+\)!"
+		).unwrap()).build();
+		let (close_filter, rx_close) = OutputFilter::new(Regex::new(
+			r"^Closing Server$"
+		).unwrap()).build();
+		my_output_filters.push(done_filter);
+		my_output_filters.push(close_filter);
+
+		// Close output_filters
+		output_filters = Arc::new(Mutex::new(my_output_filters));
+		rx_mc_ready = rx_ready;
+		rx_mc_close = rx_close;
+	}
+
+	let mut req_handler = RequestHandler::new(input, input_filters, output_filters.clone());
 	
-	// Process user commands
-	tokio::spawn(handle_minecraft_input(input, rx_req, input_filters.clone()));
+	// Process input requests (ie. user commands)
+	tokio::spawn(async move { req_handler.process(rx_req).await });
 	
 	// TODO way to request output channel
-	
-	// Output filters
-	let output_filters = Arc::new(Mutex::new(Vec::<OutputFilter>::new()));
-	
-	// Server status: ready, stopped
+
+	// TODO add listeners that say:
+	//   println!("🎁 Server is ready");
+	//   println!("🎁 Server is closing soon");
+
 	let (tx_ready, rx_ready) = ready::channel();
 	let (tx_closed, rx_closed) = ready::channel();
-	{
-		// LOCK add the start and stop filters
-		let mut output_filters = output_filters.lock().unwrap();
-		output_filters.push(OutputFilter {
-			regex: Regex::new(r"^Done \([^(]+\)!").unwrap(),
-			action: action_once(move |_ :&str| {
-				println!("🎁 Server is ready");
-				tx_ready.ready();
-			}),
-			count: Cell::new(1),
-			fail: None,
-		});
-		output_filters.push(OutputFilter {
-			regex: Regex::new("^Closing Server$").unwrap(),
-			action: action_once(move |_ :&str| {
-				println!("🎁 Server is closing soon");
-				tx_closed.ready();
-			}),
-			count: Cell::new(1),
-			fail: None,
-		});
-	}
 	
 	// Process output
 	tokio::spawn(handle_minecraft_output(output, output_filters.clone()));
 	
 	// TODO return rx_console, rx_raw_console
-	(tx_req, output_filters, input_filters, rx_ready, rx_closed)
+	(tx_req, output_filters, rx_ready, rx_closed)
 }
+
+// === Output handling ===
 
 async fn handle_minecraft_output (
 	output :impl 'static + Send + Unpin + AsyncRead,
 	output_filters :SharedOutputFilters)
 {
+	// Matches leading terminal escapes
 	let unwanted_escapes = Regex::new(r"(?x)
 		^
 		(?: > \.+         # Prompt
@@ -209,107 +132,283 @@ async fn handle_minecraft_output (
 		| \x1B\[ \?2004h
 		| \x1B =
 		) +").unwrap();
+	// Matches the timestamp (and captures the leading ansi color escape)
 	let remove_timestamp = Regex::new(r"(?x)
 		^
 		((?: \x1B \[ .*? m )*)  # ANSI color code
 		\[ .*? \]: \            # Timestamp with trailing space
 		").unwrap();
 		
-	// Console output: message-only or raw
+	// Console output channels: message-only or raw
 	let (tx_console, rx_console) = broadcast::channel::<String>(16);
 	let (tx_raw_console, rx_raw_console) = broadcast::channel::<String>(16);
 	
 	let mut output = BufReader::new(output).lines();
 	while let Some(line) = output.next().await {
-		let mut line = line.expect("io or utf error"); /* FIXME */
-		
-		// Remove interactive prompt related characters
-		if let Some(found) = unwanted_escapes.find(&line) {
-			line = line[found.end() .. ].to_string();
-		};
-		
-		// Reset colouring at the end of the line
+		let line = {
+			let mut l :String = line.expect("io or utf error"); /* FIXME */
+
+			// Remove interactive prompt related characters
+			if let Some(found) = unwanted_escapes.find(&l) {
+				l = l[found.end()..].to_string();
+			};
+			l };
+
+		// Print minecraft console to output
+		// NB: \x1B[m resets colouring at the end of the line.
+		//     Minecraft always reenables the color on the next line
 		println!("💻 {}\x1B[m", line);
 		
-		// Chop of the timestamp for tx_console
+		// Chop of the timestamp for tx_console (but keep the leading ansi color escape)
 		let message = remove_timestamp.replace(&line, "$1");
 		if message != line {
 			// We actually removed the timestamp
-			let mut message = message.into_owned(); // The (coloured) message
-			
-			// CHECK Add color reset at the end of the line (as it is always reenabled on the following line)
-			message.push_str("\x1B[m");
-			
-			// Run the output filters
-			{
-				// LOCK
-				let mut output_filters = output_filters.lock().unwrap();
-				output_filters.retain(|x| run_output_filter(x, &message));
+			let message :String = {
+				let mut m = message.into_owned(); // The (coloured) message
+
+				// WARN this can lead to having a message ending in \x1B[m\x1B[m
+				//      when Minecraft also resets the color
+				m.push_str("\x1B[m");
+				m };
+
+			{ // LOCK run the output filters
+				let output_filters = &mut *output_filters.lock().unwrap();
+				// Run each filter one by one, and remove those that are completed
+				output_filters.map_retain(|filter| run_output_filter(filter, &message));
 			}
 			
-			// errors if there are *currently* no receivers
+			// ignore error which happens when there are *currently* no receivers
 			let _ = tx_console.send(message.to_string());
 		}
-		
-		// errors if there are *currently* no receivers
+
+		// ignore error which happens when there are *currently* no receivers
 		let _ = tx_raw_console.send(line);
 	}
 }
 
-// Run a single output filter on a message, returns whether to keep checking it
-fn run_output_filter (filter :& OutputFilter, message :&str) -> bool {
+/** Run a single output filter on a message, returns whether to keep checking it.
+If there are no listeners, the filter is dropped */
+fn run_output_filter (filter :&mut OutputFilter, message :&str) -> bool {
 	// Check match
 	if !filter.regex.is_match(&message) {
 		// It didn't match, update max fail count
-		if let Some(v) = &filter.fail {
-			let remaining_tries = v.get() - 1;
-			if remaining_tries < 0 {
+		if let Some(tries) = &mut filter.fail {
+			// TODO add option: chat messages don't count towards failed matches
+
+			*tries -= 1;
+			if *tries < 0 {
 				// No more tries, removing it
 				return false;
 			}
-			v.set(remaining_tries);
 		}
 		return true;
 	};
 	
-	// Call function
-	let cb = filter.action.take().unwrap();
-	match cb {
-		FilterCallback::Once(callback) => {
-			callback(&message);
-			return false; // remove from filters
-		},
-		FilterCallback::Multiple(mut callback) => {
-			callback(&message);
-			// put it back
-			filter.action.set(Some(FilterCallback::Multiple(callback)));
-		},
+	// Send line to client
+	if let Err(_) = filter.chan.send(message.to_string()) {
+		// There are currently no receivers (which means that the client has stopped listening)
+		return false;
 	}
 	
 	// Update match count
-	let count = filter.count.get() - 1;
-	filter.count.set(count);
-	
-	count != 0 // <=> remove if last try
+	if let Some(c) = &mut filter.count {
+		*c -= 1;
+		*c != 0 // Remove if the client doesn't expect more lines
+	} else {
+		true
+	}
 }
 
-async fn handle_minecraft_input (
-	mut input :impl 'static + Send + Unpin + AsyncWrite,
-	mut rx_req :mpsc::Receiver<String>,
-	mut input_filters :SharedInputFilters,
-) {
-	while let Some(mut command) = rx_req.recv().await {
-		// Make sure the command ends with a newline
-		if !command.ends_with("\n") {
-			command.push_str("\n");
+// {{{ === Client Requests ===
+
+pub(crate) enum ConsoleCommandKind {
+	Slash,
+	GetLine(OutputFilter),
+}
+
+pub(crate) enum ClientCommand {
+	// Separate variant to access the command string generically
+	ConsoleCommand{
+		slash :String,
+		kind :ConsoleCommandKind,
+	},
+	StartGuard(OurInputFilter),
+	RenewGuard(OurInputFilter),
+	RemoveGuard(OurInputFilter),
+}
+
+/// Client commands that can be queued (because of input guards)
+pub(crate) struct ClientRequest {
+	pub(crate) done :ready::Sender,
+	pub(crate) command :ClientCommand,
+	pub(crate) client_id : u32, // For input filters
+}
+
+// }}}
+
+
+// Handles input requests and writes to minecraft console
+struct RequestHandler<I :AsyncWrite + Unpin> {
+	input :I,
+	input_filters :Vec<OurInputFilter>,
+	output_filters :SharedOutputFilters,
+
+	// input_filters :ExpiroSet,
+
+	// State for input_filters:
+	/// The source of truth for active filter list, and the key to remove it from DelayQueue
+	active_filters:HashMap<OurInputFilter, delay_queue::Key>,
+	// dangerous, removing an element can panic
+	guard_timeouts :DelayQueue<OurInputFilter>,
+	/// The list of requests that were blocked by a certain filter
+	queued_requests :HashMap<OurInputFilter, Vec<ClientRequest>>,
+}
+
+impl<I :Unpin + AsyncWrite + Send /* = makes the async work */ > RequestHandler<I> {
+	fn new (input :I, input_filters :Vec<OurInputFilter>, output_filters :SharedOutputFilters)
+		-> RequestHandler<I>
+	{
+		RequestHandler {
+			input,
+			input_filters,
+			output_filters,
+			guard_timeouts: DelayQueue::new(),
+			active_filters: HashMap::new(),
+			queued_requests: HashMap::new(),
 		}
-		
-		// DEBUG
-		print!("✏️  {}", command);
-		if let Err(_) = input.write_all(command.as_bytes()).await {
+	}
+
+	async fn process (&mut self, mut rx_req :mpsc::Receiver<ClientRequest>) {
+		loop {
+			select! {
+				// Check incoming requests
+				request = rx_req.recv() => match request {
+					Some(request) => self.process_request(request).await,
+					None => break, // CHECKME is this enough ?
+				},
+				// Check guard timeouts
+				expired = self.guard_timeouts.next() => match expired {
+					// A guard has expired, process the delayed requests
+					Some(Ok(expired)) => Pin::new(&mut *self).remove_input_filter(
+						expired.into_inner(),
+						true /* it's already removed from the delay queue*/
+					).await,
+					Some(Err(e)) => if e.is_shutdown() {
+						break; // Catastrophic timer failure
+					} else {
+						// Ignore error
+					},
+					None => unimplemented!(),
+				},
+			}
+		}
+	}
+
+	async fn process_request (&mut self, request :ClientRequest) {
+		use ClientCommand::*;
+
+		// If client wants to send a command, check that we can process it now (ie. before move),
+		// otherwise postpone the request (ie. move)
+		if let ConsoleCommand { slash, .. } = &request.command {
+			// remove leading ascii hspace
+			let slash = util::strip_leading_ascii_hspace(&slash).to_string();
+
+			// Check input_filters
+			for filter in &self.input_filters {
+				if filter.regex.is_match(&slash) {
+					if filter.client_id == request.client_id {
+						// Allow commands from the same client as the filter
+						// We break early to prevent deadlocks (?)
+						break;
+					} else {
+						// Blocked, store it in a queue
+						let queue = self.queued_requests.entry(filter.clone()).or_default();
+						queue.push(request);
+						return; // Finish
+					}
+				}
+			}
+		}
+
+		match request.command {
+			ConsoleCommand { mut slash, kind: commandkind } => {
+				use ConsoleCommandKind::*;
+
+				// Make sure the command ends with a newline
+				if !slash.ends_with("\n") {
+					slash.push_str("\n");
+				}
+
+				// DEBUG
+				print!("✏️  {}", slash);
+
+				match commandkind {
+					Slash => {
+						// Write command to console
+						self.send_command(&slash).await;
+					},
+					GetLine(filter) => {
+						{ // LOCK Enable output filter
+							let mut output_filters = self.output_filters.lock().unwrap();
+							output_filters.push(filter);
+						}
+
+						// Write command to console
+						self.send_command(&slash).await;
+					},
+				}
+			}
+			StartGuard(filter) => {
+				self.input_filters.push(filter.clone());
+				let delay_key = self.guard_timeouts.insert(filter.clone(), crate::GUARD_TIMEOUT);
+				self.active_filters.insert(filter, delay_key);
+			},
+			RenewGuard(filter) => {
+				if let Some(filter_key) = self.active_filters.get(&filter) {
+						self.guard_timeouts.reset(filter_key, crate::GUARD_TIMEOUT);
+				}
+			},
+			RemoveGuard(filter) => Pin::new(&mut *self).remove_input_filter(
+				filter, false /* also remove it from queue */
+			).await,
+			_ => unimplemented!(),
+		}
+
+		// Signal completion to the client
+		request.done.ready();
+	}
+
+	// As a standalone function because async closures are unstable
+	async fn send_command(&mut self, command: &str) {
+		if let Err(_) = self.input.write_all(command.as_bytes()).await {
 			eprintln!("🎁 Failed to write to minecraft console");
 		}
-		
-		// NB The user is informed of command completion through the output filters
+	}
+
+	/** Removes the filter and retries all the requests blocked by it.
+	`expired` is true if the filter has already been removed from the DelayQueue */
+	fn remove_input_filter (mut self :Pin<&mut Self>, filter :OurInputFilter, expired :bool)
+	-> Pin<Box<dyn '_ + Send + std::future::Future<Output = ()>>>
+	// ^ This is because we use recursive async functions (call to .process_request)
+	{
+		Box::pin(async move {
+			if let Some(key) = self.active_filters.remove(&filter) {
+				// Remove it from the DelayQueue if needed
+				if !expired {
+					self.guard_timeouts.remove(&key);
+				}
+
+				// Remove it from the input filters, which *should* contain it
+				let myself = &mut *self;
+				myself.input_filters.remove(myself.input_filters.iter().position(|x| *x == filter).unwrap());
+
+				// Retry queued requests, if any
+				if let Some(queued_requests) = self.queued_requests.remove(&filter) {
+					for r in queued_requests {
+						self.process_request(r).await
+					}
+				}
+			}
+		})
 	}
 }

@@ -1,4 +1,7 @@
-/target
+/target/
 
 # IDE
 /.idea/
+
+# temp
+/tmp/

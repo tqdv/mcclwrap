@@ -1,5 +1,8 @@
 # Notes
 
+- `SharedOutputFilters` is a Vec instad of a HashSet/HashMap because that's faster.
+  But `SharedInputFilters` is a HashMap because we need to remove our filter.
+
 ## TODO
 
 - Send all output to a function because we're handling user input

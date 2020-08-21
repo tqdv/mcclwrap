@@ -1,25 +1,26 @@
 mod slang;
 mod ready;
+mod expiroset;
 mod secretary;
 mod minecraft;
+mod filters;
 mod util; mod exitcode;
 
 // use crate slang
 use crate::slang::*;
 
 // import crate symbols
-use secretary::{listen_on_socket};
-use minecraft::{get_minecraft, run_minecraft, handle_minecraft_io};
+use minecraft::{get_minecraft, run_minecraft, handle_minecraft_io, ClientRequest};
 use util::{sigint_process, sigkill_process};
 use exitcode::ExitCode;
 
 // Import other symbols
-use tokio::{select, join};
+use tokio::join;
 
 use std::path::PathBuf;
 use std::future::Future;
 use tokio::net::UnixListener;
-use tokio::time::{Duration, delay_for};
+use tokio::time::delay_for;
 
 mod error {
 	use thiserror::Error;
@@ -46,16 +47,28 @@ const FORCE_SHUTDOWN_DELAY :Duration = Duration::from_millis(1000);
 // === Other listeners ===
 
 // TODO make it look better and handle tab completion
-fn handle_stdin
-	(mut tx_req :mpsc::Sender<String>) -> tokio::task::JoinHandle<()>
-{
+fn handle_stdin	(mut tx_req :mpsc::Sender<ClientRequest>) -> tokio::task::JoinHandle<()> {
+	use minecraft::{ClientCommand, ConsoleCommandKind};
+
+	let client_id = secretary::get_client_id();
 	tokio::spawn(async move { 
 		let mut stdin = BufReader::new(io::stdin()).lines();
 		while let Some(line) = stdin.next().await {
 			let line = line.expect("io or unicode error");
-			
-			if let Err(_) = tx_req.send(line).await {
+
+			let (tx, rx) = ready::channel();
+			let slash = util::strip_leading_ascii_hspace(&line).to_string();
+			let req = ClientRequest {
+				client_id,
+				done: tx,
+				command: ClientCommand::ConsoleCommand{ slash, kind: ConsoleCommandKind::Slash },
+			};
+
+			if let Err(_) = tx_req.send(req).await {
 				eprintln!("🎁 Minecraft console input isn't handled anymore");
+			}
+			if let None = rx.await {
+				eprintln!("🎁 Failed to process standard input command"); // FIXME ?
 			}
 		}
 	})
@@ -195,8 +208,8 @@ async fn async_main () -> Result<(), error::Main> {
 	// Setup listeners for SIGINT/SIGTERM, minecraft console,
 	// socket clients, and stdin
 	let rx_sig = get_signal_channel(); // CHECK why is this here ?
-	let (tx_req, output_filters, input_filters, rx_ready, rx_closed) = handle_minecraft_io(mc_in, mc_out);
-	listen_on_socket(listener, rx_ready.clone(), tx_req.clone(), output_filters, input_filters);
+	let (tx_req, output_filters, rx_ready, rx_closed) = handle_minecraft_io(mc_in, mc_out);
+	secretary::listen_on_socket(listener, rx_ready.clone(), tx_req.clone());
 	handle_stdin(tx_req);
 	
 	// TODO start timers
