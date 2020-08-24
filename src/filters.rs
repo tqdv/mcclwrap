@@ -1,5 +1,6 @@
 //! Data types used for filtering the Minecraft console IO
 use crate::slang::*;
+use crate::ready;
 
 // === Output Filters ===
 
@@ -26,7 +27,7 @@ pub(crate) struct InputFilter {
 	// Filter data:
 	pub(crate) regex :Regex,
 	/// To signal guard expiration
-	pub(crate) chan :oneshot::Sender<()>, // FIXME
+	pub(crate) expired :ready::Sender,
 	/// To allow requests sent by the same client
 	pub(crate) client_id :u32,
 }
@@ -36,7 +37,7 @@ pub(crate) struct OurInputFilter (pub(crate) Arc<InputFilter>);
 
 // === Output produced by the filters
 
-struct FilterOutput {
+pub(crate) struct FilterOutput {
 	filter_id :u32,
 	message :FilterOutputMessage
 }

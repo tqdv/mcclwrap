@@ -6,10 +6,11 @@ use crate::{ready, util};
 use tokio::sync::broadcast;
 
 use crate::filters::{OurInputFilter, OutputFilter, SharedOutputFilters};
+use crate::expiroset::ExpiroSet;
 use std::pin::Pin;
+use std::future::Future;
 use std::collections::HashMap;
 use tokio::process::{Command, Child, ChildStdin, ChildStdout};
-use tokio::time::{DelayQueue, delay_queue};
 
 use std::convert::TryInto as _;
 
@@ -68,14 +69,14 @@ pub(crate) fn run_minecraft (mc :Child, mut tx_stop :mpsc::Sender<()>)
 pub(crate) fn handle_minecraft_io <I, O> (input :I, output :O)
 	-> (mpsc::Sender<ClientRequest>, SharedOutputFilters, ready::Receiver, ready::Receiver)
 	where
-		I : 'static + Send + Unpin + AsyncWrite,
+		I : 'static + Send + Sync + Unpin + AsyncWrite,
 		O : 'static + Send + Unpin + AsyncRead,
 {
 	// User commands
 	let (tx_req, rx_req) = mpsc::channel::<ClientRequest>(64);
 
 	// Input filters (for command guards)
-	let input_filters = Vec::new();
+	let input_filters = ExpiroSet::new();
 	// Output filters
 	let (output_filters, rx_mc_ready, rx_mc_close);
 	{ // Initialize output filters with server status filters
@@ -163,13 +164,21 @@ async fn handle_minecraft_output (
 		let message = remove_timestamp.replace(&line, "$1");
 		if message != line {
 			// We actually removed the timestamp
-			let message :String = {
-				let mut m = message.into_owned(); // The (coloured) message
+			mut_scope!{ message,
+				let mut message = message.into_owned(); // The (coloured) message
 
 				// WARN this can lead to having a message ending in \x1B[m\x1B[m
 				//      when Minecraft also resets the color
-				m.push_str("\x1B[m");
-				m };
+				message.push_str("\x1B[m");
+			}
+
+			// let message :String = {
+			// 	let mut m = message.into_owned(); // The (coloured) message
+			//
+			// 	// WARN this can lead to having a message ending in \x1B[m\x1B[m
+			// 	//      when Minecraft also resets the color
+			// 	m.push_str("\x1B[m");
+			// 	m };
 
 			{ // LOCK run the output filters
 				let output_filters = &mut *output_filters.lock().unwrap();
@@ -250,34 +259,25 @@ pub(crate) struct ClientRequest {
 // Handles input requests and writes to minecraft console
 struct RequestHandler<I :AsyncWrite + Unpin> {
 	input :I,
-	input_filters :Vec<OurInputFilter>,
 	output_filters :SharedOutputFilters,
-
-	// input_filters :ExpiroSet,
-
-	// State for input_filters:
-	/// The source of truth for active filter list, and the key to remove it from DelayQueue
-	active_filters:HashMap<OurInputFilter, delay_queue::Key>,
-	// dangerous, removing an element can panic
-	guard_timeouts :DelayQueue<OurInputFilter>,
-	/// The list of requests that were blocked by a certain filter
-	queued_requests :HashMap<OurInputFilter, Vec<ClientRequest>>,
+	input_filters :ExpiroSet<OurInputFilter>,
+	/// Stores the requests blocked by an input filter
+	queued_requests :HashMap<OurInputFilter, Vec<ClientRequest>>
 }
 
-impl<I :Unpin + AsyncWrite + Send /* = makes the async work */ > RequestHandler<I> {
-	fn new (input :I, input_filters :Vec<OurInputFilter>, output_filters :SharedOutputFilters)
-		-> RequestHandler<I>
-	{
+/* Send+Sync makes the async work somehow */
+impl<I :Unpin + AsyncWrite + Send + Sync> RequestHandler<I> {
+	fn new (input :I, input_filters :ExpiroSet<OurInputFilter>, output_filters :SharedOutputFilters)
+	-> RequestHandler<I> {
 		RequestHandler {
 			input,
 			input_filters,
 			output_filters,
-			guard_timeouts: DelayQueue::new(),
-			active_filters: HashMap::new(),
 			queued_requests: HashMap::new(),
 		}
 	}
 
+	/// Entry point
 	async fn process (&mut self, mut rx_req :mpsc::Receiver<ClientRequest>) {
 		loop {
 			select! {
@@ -287,65 +287,34 @@ impl<I :Unpin + AsyncWrite + Send /* = makes the async work */ > RequestHandler<
 					None => break, // CHECKME is this enough ?
 				},
 				// Check guard timeouts
-				expired = self.guard_timeouts.next() => match expired {
+				expired = self.input_filters.next() => match expired {
 					// A guard has expired, process the delayed requests
-					Some(Ok(expired)) => Pin::new(&mut *self).remove_input_filter(
-						expired.into_inner(),
-						true /* it's already removed from the delay queue*/
-					).await,
-					Some(Err(e)) => if e.is_shutdown() {
-						break; // Catastrophic timer failure
-					} else {
-						// Ignore error
+					Some(Ok(expired)) => self.retry_requests_blocked_by(&expired).await,
+					Some(Err(e)) => {
+						if e.is_shutdown() { break; /* Catastrophic timer failure */ }
+						// Otherwise, ignore error
 					},
-					None => unimplemented!(),
+					None => (), // No items in queue, do nothing
 				},
 			}
 		}
 	}
 
+	/// Process a single request
 	async fn process_request (&mut self, request :ClientRequest) {
 		use ClientCommand::*;
+		use ConsoleCommandKind::*;
 
-		// If client wants to send a command, check that we can process it now (ie. before move),
-		// otherwise postpone the request (ie. move)
-		if let ConsoleCommand { slash, .. } = &request.command {
-			// remove leading ascii hspace
-			let slash = util::strip_leading_ascii_hspace(&slash).to_string();
+		// Check input filters first
+		let request = tear! { self.check_input_filters(request) => tear::gut };
 
-			// Check input_filters
-			for filter in &self.input_filters {
-				if filter.regex.is_match(&slash) {
-					if filter.client_id == request.client_id {
-						// Allow commands from the same client as the filter
-						// We break early to prevent deadlocks (?)
-						break;
-					} else {
-						// Blocked, store it in a queue
-						let queue = self.queued_requests.entry(filter.clone()).or_default();
-						queue.push(request);
-						return; // Finish
-					}
-				}
-			}
-		}
-
+		// The request should be processed now
 		match request.command {
-			ConsoleCommand { mut slash, kind: commandkind } => {
-				use ConsoleCommandKind::*;
-
-				// Make sure the command ends with a newline
-				if !slash.ends_with("\n") {
-					slash.push_str("\n");
-				}
-
-				// DEBUG
-				print!("✏️  {}", slash);
-
+			ConsoleCommand { slash, kind: commandkind } => {
 				match commandkind {
 					Slash => {
 						// Write command to console
-						self.send_command(&slash).await;
+						self.send_command(slash).await;
 					},
 					GetLine(filter) => {
 						{ // LOCK Enable output filter
@@ -354,59 +323,75 @@ impl<I :Unpin + AsyncWrite + Send /* = makes the async work */ > RequestHandler<
 						}
 
 						// Write command to console
-						self.send_command(&slash).await;
+						self.send_command(slash).await;
 					},
 				}
 			}
 			StartGuard(filter) => {
-				self.input_filters.push(filter.clone());
-				let delay_key = self.guard_timeouts.insert(filter.clone(), crate::GUARD_TIMEOUT);
-				self.active_filters.insert(filter, delay_key);
+				self.input_filters.insert(filter, crate::GUARD_TIMEOUT);
 			},
 			RenewGuard(filter) => {
-				if let Some(filter_key) = self.active_filters.get(&filter) {
-						self.guard_timeouts.reset(filter_key, crate::GUARD_TIMEOUT);
-				}
+				self.input_filters.reset(&filter, crate::GUARD_TIMEOUT);
 			},
-			RemoveGuard(filter) => Pin::new(&mut *self).remove_input_filter(
-				filter, false /* also remove it from queue */
-			).await,
+			RemoveGuard(filter) => {
+				self.input_filters.remove(&filter);
+				self.retry_requests_blocked_by(&filter).await;
+			},
 			_ => unimplemented!(),
 		}
 
-		// Signal completion to the client
+		// Signal request completion to the client
 		request.done.ready();
 	}
 
-	// As a standalone function because async closures are unstable
-	async fn send_command(&mut self, command: &str) {
+	/** Check the request against the input filters. Returns the request if it passed them
+	(otherwise, consume the request and queue it) */
+	fn check_input_filters(&mut self, request: ClientRequest) -> Option<ClientRequest> {
+		// input_filters only apply on console commands
+		if let ClientCommand::ConsoleCommand { slash, .. } = &request.command {
+			// match the regexes against the command without leading ascii hspace
+			let slash = util::strip_leading_ascii_hspace(&slash).to_string();
+
+			for filter in self.input_filters.iter() {
+				if filter.regex.is_match(&slash) {
+					// Allow commands from the same client as the filter
+					if filter.client_id == request.client_id {
+						break;
+					}
+
+					// Blocked, queue the request
+					let queue = self.queued_requests.entry(filter.clone()).or_default();
+					queue.push(request);
+					return None; // Done processing
+				}
+			}
+		}
+		Some(request) // Give it back
+	}
+
+	/// Send a command, making sure the string ends with a newline
+	async fn send_command(&mut self, command: String) {
+		mut_scope! { command,
+			if !command.ends_with("\n") { command.push_str("\n"); }
+		}
+
+		// DEBUG
+		print!("✏️  {}", command);
+
 		if let Err(_) = self.input.write_all(command.as_bytes()).await {
 			eprintln!("🎁 Failed to write to minecraft console");
 		}
 	}
 
-	/** Removes the filter and retries all the requests blocked by it.
-	`expired` is true if the filter has already been removed from the DelayQueue */
-	fn remove_input_filter (mut self :Pin<&mut Self>, filter :OurInputFilter, expired :bool)
-	-> Pin<Box<dyn '_ + Send + std::future::Future<Output = ()>>>
-	// ^ This is because we use recursive async functions (call to .process_request)
-	{
+	/// Retries all the requests blocked by a filter
+	fn retry_requests_blocked_by<'a> (&'a mut self, filter :&'a OurInputFilter)
+	-> Pin<Box<dyn 'a + Send + Future<Output = ()>>> {
+		// let myself = Pin::new(self); // FIXME I had to use Pin<&'a mut Self>, why is it not complaining now ?
+		// let myself = self;
 		Box::pin(async move {
-			if let Some(key) = self.active_filters.remove(&filter) {
-				// Remove it from the DelayQueue if needed
-				if !expired {
-					self.guard_timeouts.remove(&key);
-				}
-
-				// Remove it from the input filters, which *should* contain it
-				let myself = &mut *self;
-				myself.input_filters.remove(myself.input_filters.iter().position(|x| *x == filter).unwrap());
-
-				// Retry queued requests, if any
-				if let Some(queued_requests) = self.queued_requests.remove(&filter) {
-					for r in queued_requests {
-						self.process_request(r).await
-					}
+			if let Some(queued_requests) = self.queued_requests.remove(filter) {
+				for r in queued_requests {
+					self.process_request(r).await
 				}
 			}
 		})

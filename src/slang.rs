@@ -33,6 +33,16 @@ pub(crate) trait StringExt {
 	fn now_ends_with (&mut self, suf :&str);
 }
 
+macro_rules! mut_scope {
+	( $var:ident, $($block:tt)* ) => {
+		let mut $var = $var;
+		let $var = {
+			$($block)*;
+			$var
+		};
+	}
+}
+
 // === `impl`s ===
 
 impl<T> ResultExt<T> for Result<T, T> {

@@ -1,4 +1,4 @@
-mod slang;
+#[macro_use] mod slang;
 mod ready;
 mod expiroset;
 mod secretary;

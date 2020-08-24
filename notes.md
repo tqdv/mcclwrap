@@ -1,5 +1,8 @@
 # Notes
 
+- I have no idea when a type needs to be Pin, Unpin, Send or Sync. They're usually added because the compiler complains
+  about async functions not being Send. 
+
 - `SharedOutputFilters` is a Vec instad of a HashSet/HashMap because that's faster.
   But `SharedInputFilters` is a HashMap because we need to remove our filter.
 

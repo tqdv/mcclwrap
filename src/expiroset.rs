@@ -1,38 +1,44 @@
-/*! A set of elements that can expire
+//! ExpiroSet: An ordered list of elements that expire after a timeout
 
-You insert and remove `Arc<T>`. This is because we're using it to share the item between the
-hashmap and the delayqueue.
-
-inserting removing elements with insert and remove
-advancing expiry state with ?
-*/
-
+use std::task::{Poll, Context}; use std::pin::Pin;
 use std::sync::Arc;
-use std::collections::HashMap;
-use std::task::{Poll, Context};
-use std::pin::Pin;
-use tokio::time::delay_queue::{self, DelayQueue, Expired};
 use tokio::time::Duration;
+use tokio::time::delay_queue::{self, DelayQueue};
 
 use std::hash::Hash;
 
-struct ExpiroSet<T :Hash + Eq> {
-	map :HashMap<Arc<T>, delay_queue::Key>,
+/** An ordered list of elements that expire after a timeout
+
+Based on `tokio::time::DelayQueue`.
+
+Use the `Stream` implementation to extract and advance the timers.\
+Use `.iter` to iterate over the elements in insertion order
+*/
+pub(crate) struct ExpiroSet<T :Hash + Eq> {
+	vmap :Vec<(Arc<T>, delay_queue::Key)>,
 	queue :DelayQueue<Arc<T>>,
 }
 
 impl<T :Hash + Eq> ExpiroSet<T> {
-	/** Inserts the value into the set with the given timeout. Returns if the value is new to the set */
-	pub fn insert (&mut self, value :Arc<T>, timeout :Duration) -> bool {
-		let key = self.queue.insert(value.clone(), timeout);
-		self.map.insert(value, key).is_none()
+	/// Creates a new ExpiroSet
+	pub fn new () -> Self {
+		Self {
+			vmap: Vec::new(),
+			queue: DelayQueue::new(),
+		}
 	}
 
-	/** Removes the value from the set. Returns whether the value belonged to the set */
-	pub fn remove<B> (&mut self, value :&Arc<T>) -> bool
-	{
-		if let Some(queue_key) = self.map.remove(value) {
-			// It hasn't expired yet, remove it from the queue
+	/// Adds the value to the back of the list with the given timeout
+	pub fn insert (&mut self, value :T, timeout :Duration) {
+		let value = Arc::new(value);
+		let key = self.queue.insert(value.clone(), timeout);
+		self.vmap.push((value, key));
+	}
+
+	/// Removes the value from the list. Returns whether the value was present
+	pub fn remove (&mut self, value :&T) -> bool {
+		if let Some(i) = self.get_pos(value) {
+			let (_, queue_key) = self.vmap.remove(i);
 			self.queue.remove(&queue_key);
 			true
 		} else {
@@ -40,9 +46,10 @@ impl<T :Hash + Eq> ExpiroSet<T> {
 		}
 	}
 
-	/** Sets the delay of value to timeout. Returns whether it was successful (ie. still in the set) */
-	pub fn reset (&mut self, value :&Arc<T>, timeout :Duration) -> bool {
-		if let Some(queue_key) = self.map.get(value) {
+	/// Sets the timeout of the value. Returns whether it was successful (ie. the value is present)
+	pub fn reset (&mut self, value :&T, timeout :Duration) -> bool {
+		if let Some(i) = self.get_pos(value) {
+			let (_, queue_key) = &self.vmap[i];
 			self.queue.reset(queue_key, timeout);
 			true
 		} else {
@@ -50,23 +57,40 @@ impl<T :Hash + Eq> ExpiroSet<T> {
 		}
 	}
 
+	/// Returns an iterator over the items in insertion order
+	pub fn iter (&self) -> impl '_ + Iterator<Item = &T> {
+		self.vmap.iter().map(|v| &*v.0)
+	}
+
 	/** Tries to pull an element out of the delay queue, registering the wakeup when needed.
-	Returns None when there are currently no items in the queue */
-	fn poll_expired (&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Expired<Arc<T>>, tokio::time::Error>>> {
+	Returns None when there are _currently_ no items in the queue */
+	fn poll_expired (&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, tokio::time::Error>>> {
 		// This also registers the waker
 		let status = self.queue.poll_expired(cx);
 		// If it has been removed from the queue, also remove it from the map
 		if let Poll::Ready(Some(Ok(expired))) = &status {
-			let expired = expired.into_inner();
-			self.map.remove(&expired);
+			let value :Arc<T> = expired.into_inner();
+			if let Some(i) = self.get_pos(&value) {
+				self.vmap.remove(i);
+			}
+			Poll::Ready(Some(Ok(*value)))
+		} else {
+			// convert Poll<Option<Result< Expired<Arc<T>> >… into Poll<Option<Result< T >…
+			status.map(|option| option.map(|result| result.map(|expired| *expired.into_inner())))
 		}
-		status
+	}
+
+	/// Returns the position of value in the map if it is found
+	fn get_pos (&self, value :&T) -> Option<usize> {
+		self.vmap.iter().position(|e| *e.0 == *value)
 	}
 }
 
+/// See StreamExt
 impl<T :Hash + Eq> tokio::stream::Stream for ExpiroSet<T> {
-	type Item = Result<Expired<Arc<T>>, tokio::time::Error>;
+	type Item = Result<T, tokio::time::Error>;
 
+	/// NB: this also registers the waker
 	fn poll_next (self :Pin<&mut Self>, cx :&mut Context) -> Poll<Option<Self::Item>> {
 		Self::poll_expired(self.get_mut(), cx)
 	}

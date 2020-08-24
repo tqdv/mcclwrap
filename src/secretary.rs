@@ -20,8 +20,7 @@ cya → close this connection
 use crate::slang::*;
 
 use crate::ready;
-
-use crate::filters::{self, OutputFilter, OurInputFilter};
+use crate::filters::{self, OutputFilter, OurInputFilter, FilterOutput};
 use crate::minecraft::{ClientRequest, ClientCommand, ConsoleCommandKind};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -232,7 +231,7 @@ impl Client {
 				let (request, rx_done) = self.new_request(ClientCommand::StartGuard(filter));
 
 				// Insert it first into the active requests
-				self.input_filters.insert() // FIXME
+				self.input_filters.insert(); // FIXME
 
 				// Send the request
 				if let Err(_) = self.tx_req.send(request).await {
