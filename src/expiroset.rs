@@ -1,11 +1,10 @@
 //! ExpiroSet: An ordered list of elements that expire after a timeout
 
 use std::task::{Poll, Context}; use std::pin::Pin;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::time::Duration;
-use tokio::time::delay_queue::{self, DelayQueue};
-
-use std::hash::Hash;
+use tokio::time::delay_queue::{self, DelayQueue, Expired};
 
 /** An ordered list of elements that expire after a timeout
 
@@ -14,12 +13,13 @@ Based on `tokio::time::DelayQueue`.
 Use the `Stream` implementation to extract and advance the timers.\
 Use `.iter` to iterate over the elements in insertion order
 */
-pub(crate) struct ExpiroSet<T :Hash + Eq> {
+// The Arc<T> is only shared between the vmap and the queue
+pub(crate) struct ExpiroSet<T> {
 	vmap :Vec<(Arc<T>, delay_queue::Key)>,
 	queue :DelayQueue<Arc<T>>,
 }
 
-impl<T :Hash + Eq> ExpiroSet<T> {
+impl<T :Eq + Debug> ExpiroSet<T> {
 	/// Creates a new ExpiroSet
 	pub fn new () -> Self {
 		Self {
@@ -65,18 +65,24 @@ impl<T :Hash + Eq> ExpiroSet<T> {
 	/** Tries to pull an element out of the delay queue, registering the wakeup when needed.
 	Returns None when there are _currently_ no items in the queue */
 	fn poll_expired (&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, tokio::time::Error>>> {
-		// This also registers the waker
+		// NB this also registers the waker
 		let status = self.queue.poll_expired(cx);
+
 		// If it has been removed from the queue, also remove it from the map
-		if let Poll::Ready(Some(Ok(expired))) = &status {
+		if let Poll::Ready(Some(Ok(expired))) = status {
 			let value :Arc<T> = expired.into_inner();
 			if let Some(i) = self.get_pos(&value) {
 				self.vmap.remove(i);
 			}
-			Poll::Ready(Some(Ok(*value)))
+
+			// Unwrap shouldn't fail because we removed it from vmap too.
+			let value :T = Arc::try_unwrap(value).unwrap();
+			Poll::Ready(Some(Ok(value)))
 		} else {
 			// convert Poll<Option<Result< Expired<Arc<T>> >… into Poll<Option<Result< T >…
-			status.map(|option| option.map(|result| result.map(|expired| *expired.into_inner())))
+			status.map(|v :Option<_>| v.map(|v :Result<_, _>| v.map(
+				|_ :Expired<_>| unreachable!() // Converts to the right type
+			)))
 		}
 	}
 
@@ -87,10 +93,10 @@ impl<T :Hash + Eq> ExpiroSet<T> {
 }
 
 /// See StreamExt
-impl<T :Hash + Eq> tokio::stream::Stream for ExpiroSet<T> {
+impl<T :Eq + Debug> tokio::stream::Stream for ExpiroSet<T> {
 	type Item = Result<T, tokio::time::Error>;
 
-	/// NB: this also registers the waker
+	/// NB: this also registers the waker cf. ExpiroSet::poll_expired
 	fn poll_next (self :Pin<&mut Self>, cx :&mut Context) -> Poll<Option<Self::Item>> {
 		Self::poll_expired(self.get_mut(), cx)
 	}

@@ -75,17 +75,17 @@ pub struct Receiver {
 #[derive(Debug)]
 struct Shared {
 	ready :AtomicUsize,
-	// WARN This mutex protects the hashset AND the atomicusize !
+	/// WARN This mutex protects the hashset AND the atomicusize !
 	listeners :Mutex<HashSet<Listener>>,
 }
 
 impl Sender {
+	/// Returns None if there are no receivers
 	pub fn ready(&self) -> Option<()> {
 		// Check if we have receivers
 		let shared = terror! { self.shared.upgrade() };
 		
-		{
-			// LOCK
+		{ // LOCK listeners
 			let listeners = shared.listeners.lock().unwrap();
 			
 			// Set state

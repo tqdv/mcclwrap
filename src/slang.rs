@@ -1,7 +1,6 @@
 //! Our slang
 
 pub(crate) use tear::prelude::*;
-pub(crate) use tear::ret;
 pub(crate) use tokio::prelude::*;
 pub(crate) use lazy_static::lazy_static;
 pub(crate) use tokio::select;
@@ -16,6 +15,7 @@ pub(crate) use tokio::io::BufReader;
 pub(crate) use tokio::time::Duration;
 
 pub(crate) use tokio::stream::StreamExt as _;
+pub(crate) use futures::FutureExt as _;
 
 pub(crate) trait ResultExt<T> {
 	/// Returns the inner value if both Ok and Err wrap the same type
@@ -37,7 +37,7 @@ macro_rules! mut_scope {
 	( $var:ident, $($block:tt)* ) => {
 		let mut $var = $var;
 		let $var = {
-			$($block)*;
+			$($block)*
 			$var
 		};
 	}

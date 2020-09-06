@@ -11,6 +11,7 @@ thiserror = "1.0"
 tear = { version = "0.4", path = "../tear" }
 lazy_static = "1.4"
 
+futures = "0.3"
 tokio = { version = "0.2", features = ["macros", "uds", "stream", "io-std", "io-util", "rt-core", "process", "signal", "sync", "time"] }
 nix = "0.18"
 

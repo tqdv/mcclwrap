@@ -10,7 +10,7 @@ mod util; mod exitcode;
 use crate::slang::*;
 
 // import crate symbols
-use minecraft::{get_minecraft, run_minecraft, handle_minecraft_io, ClientRequest};
+use minecraft::{get_minecraft, run_minecraft, handle_minecraft_io, AttendantRequest};
 use util::{sigint_process, sigkill_process};
 use exitcode::ExitCode;
 
@@ -25,21 +25,22 @@ use tokio::time::delay_for;
 mod error {
 	use thiserror::Error;
 
-	use crate::minecraft::error::StartMinecraft;
+	use crate::minecraft::MinecraftError;
 	use std::path::PathBuf;
 
 	#[derive(Error, Debug)]
-	pub(crate) enum Main {
+	pub(crate) enum ProgramFailure {
 		#[error(transparent)]
-		Minecraft(#[from] StartMinecraft),
+		Minecraft(#[from] MinecraftError),
 		#[error("Failed to bind to socket {0}")]
 		CreateSocket(PathBuf, #[source] tokio::io::Error),
 	}
 }
+use error::ProgramFailure;
 
 const _OUR_NAME :&str = "mcclwrap";
 const SOCKET_PATH :&str  = "test.sock";
-const GUARD_TIMEOUT :Duration = Duration::from_secs(30); // How long an input guard lasts (and for how long it renews)
+const GUARD_TIMEOUT_SECS :u64 = 15;     // How long an input guard lasts by default
 
 const RT_SHUTDOWN_DELAY :Duration = Duration::from_millis(1000);
 const FORCE_SHUTDOWN_DELAY :Duration = Duration::from_millis(1000);
@@ -47,8 +48,8 @@ const FORCE_SHUTDOWN_DELAY :Duration = Duration::from_millis(1000);
 // === Other listeners ===
 
 // TODO make it look better and handle tab completion
-fn handle_stdin	(mut tx_req :mpsc::Sender<ClientRequest>) -> tokio::task::JoinHandle<()> {
-	use minecraft::{ClientCommand, ConsoleCommandKind};
+fn handle_stdin	(mut tx_req :mpsc::Sender<AttendantRequest>) -> tokio::task::JoinHandle<()> {
+	use minecraft::AttendantCommand::SendCommand;
 
 	let client_id = secretary::get_client_id();
 	tokio::spawn(async move { 
@@ -58,10 +59,10 @@ fn handle_stdin	(mut tx_req :mpsc::Sender<ClientRequest>) -> tokio::task::JoinHa
 
 			let (tx, rx) = ready::channel();
 			let slash = util::strip_leading_ascii_hspace(&line).to_string();
-			let req = ClientRequest {
+			let req = AttendantRequest {
 				client_id,
 				done: tx,
-				command: ClientCommand::ConsoleCommand{ slash, kind: ConsoleCommandKind::Slash },
+				command: SendCommand(slash),
 			};
 
 			if let Err(_) = tx_req.send(req).await {
@@ -184,7 +185,7 @@ async fn handle_stop_signals (
 
 // === Main functions ===
 
-async fn async_main () -> Result<(), error::Main> {
+async fn async_main () -> Result<(), error::ProgramFailure> {
 	let socket_path = PathBuf::from(SOCKET_PATH);
 	
 	let (tx_stop, rx_stop) = mpsc::channel::<()>(2);
@@ -192,7 +193,7 @@ async fn async_main () -> Result<(), error::Main> {
 	// Create the socket
 	let listener = terror! {
 		UnixListener::bind(&socket_path)
-		=> |e| error::Main::CreateSocket(socket_path, e)
+		=> |e| ProgramFailure::CreateSocket(socket_path, e)
 	};
 	
 	// Get minecraft process
@@ -205,26 +206,34 @@ async fn async_main () -> Result<(), error::Main> {
 	// Run minecraft in the background
 	let mc_handle = run_minecraft(mc, tx_stop);
 	
-	// Setup listeners for SIGINT/SIGTERM, minecraft console,
-	// socket clients, and stdin
+	// Setup listeners for SIGINT/SIGTERM, minecraft console, socket clients, and stdin
 	let rx_sig = get_signal_channel(); // CHECK why is this here ?
-	let (tx_req, output_filters, rx_ready, rx_closed) = handle_minecraft_io(mc_in, mc_out);
+	let (tx_req, rx_ready, rx_closed) = handle_minecraft_io(mc_in, mc_out);
 	secretary::listen_on_socket(listener, rx_ready.clone(), tx_req.clone());
 	handle_stdin(tx_req);
 	
 	// TODO start timers
-	
+
 	// Prepare cleanup task
 	let cleanup_task = get_cleanup_task(
 		socket_path, mc_pid, mc_handle, rx_closed.clone()
 	);
+
+	tokio::spawn(async {
+		let mut interval = tokio::time::interval(Duration::from_secs(3));
+		loop {
+			interval.tick().await;
+			println!("DEBUG tick");
+		}
+	});
 	
-	println!("🎁 Initialisation complete");
-	
+	println!("🎁 Initialization complete");
+
 	// Block main thread until we're told to stop
 	handle_stop_signals(
 		cleanup_task, mc_pid, rx_closed, rx_sig, rx_stop
 	).await;
+	delay_for(Duration::from_secs(10)).await;
 	
 	Ok(())
 }
