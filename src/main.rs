@@ -51,7 +51,7 @@ const FORCE_SHUTDOWN_DELAY :Duration = Duration::from_millis(1000);
 fn handle_stdin	(mut tx_req :mpsc::Sender<AttendantRequest>) -> tokio::task::JoinHandle<()> {
 	use minecraft::AttendantCommand::SendCommand;
 
-	let client_id = secretary::get_client_id();
+	let client_id = secretary::get_attendant_id();
 	tokio::spawn(async move { 
 		let mut stdin = BufReader::new(io::stdin()).lines();
 		while let Some(line) = stdin.next().await {

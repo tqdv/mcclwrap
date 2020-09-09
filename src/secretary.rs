@@ -1,6 +1,45 @@
 //! Functions that handle incoming connection and commands on the socket
 
-/*! Socket language:
+/*!
+
+# Synopsis
+```
+let rx_ready = unimplemented!(); // Server ready channel
+let tx_req = unimplemented!();   // Minecraft request sender
+secretary::listen_on_socket(socket, rx_ready, tx_req);
+```
+
+# Socket language
+
+Client commands look like this:
+```raku
+rx {
+	^
+	$<header> = [
+		[ "[" <[0..9]> ** 1..9 "] " ]?       # Optional command id
+		$<command> = [ <-[ \  \[ ]> + ]  # Command
+	]
+	[ " " $<args> = (.*) ]?           # Command arguments
+	$
+}
+```
+
+And replies look like this:
+```text
+rx {
+	^
+	$<header> = [
+		[ "[" <[0..9]> + "] " ]?      # Optional command id
+		$<command> = [ <-[ \  ]> + ]  # Command
+	]
+	": " [ ok | error | bail ]        # Command status
+	[ " " $<message> = [.*] ]?        # Optional command message
+	$
+}
+```
+
+
+FIXME these are out of date
 ```text
 ready → wait for server ready
 	=> ok: ready → server ready
@@ -91,33 +130,47 @@ pub(crate) fn listen_on_socket (
 	})
 }
 
-/// Returns a new client id. This _can_ overflow (after 2**32)
-pub(crate) fn get_client_id () -> u32 {
+/// Returns a new attendant id. This _can_ overflow (after 2**32)
+pub(crate) fn get_attendant_id() -> u32 {
 	static COUNTER :AtomicU32 = AtomicU32::new(0);
 	COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 // Parsing regexes
 lazy_static! {
+	/// lazy_static regex for command components
+	static ref GET_HEADER_REGEX :Regex = Regex::new(r"(?x)
+		^ (
+			(?: \[ [0-9]{1,9} \] \  )?  # Command id eg. [5]
+			([^ \  \[ ])                # Command
+		)                               # = reply header
+		(?: \  (.*) )?                  # Command arguments
+		$").unwrap();
+
+	/// lazy_static regex for get-line command
 	static ref GET_LINE_REGEX :Regex = Regex::new(r###"(?x)
 		^ r\#" (.*?) "\#   # regex
 		\  (.+)            # command
 		$"###).unwrap();
 
+	/// lazy_static regex for guard-begin command
 	static ref GUARD_BEGIN_REGEX :Regex = Regex::new(r###"(?x)
 		^ r\#" (.*?) "\#         # Regex eg. r#"^save-"#
 		(?: \  ( [0-9]+ ) s )?   # Optional duration eg. 5s
 		$"###).unwrap();
 
+	/// lazy_static regex for guard-renew command
 	static ref GUARD_RENEW_REGEX :Regex = Regex::new(r#"(?x)
 		^ ([0-9]+)       # guard id
 		\  ([0-9]+) s    # duration
 		$"#).unwrap();
 
+	/// lazy_static regex for guard-end command
 	static ref GUARD_END_REGEX :Regex = Regex::new(r#"(?x)
 		^ ([0-9]+)       # guard id
 		$"#).unwrap();
 
+	/// lazy_static regex for filter-start command
 	static ref FILTER_START_REGEX :Regex = Regex::new(r###"(?x)
 		^ r\#" (.*?) "\#         # Regex eg. r#"^save-"#
 		(?: \
@@ -128,6 +181,7 @@ lazy_static! {
 		)*
 		$"###).unwrap();
 
+	/// lazy_static regex for filter-stop command
 	static ref FILTER_STOP_REGEX :Regex = Regex::new(r#"(?x)
 		^ ([0-9]+)       # filter id
 		$"#).unwrap();
@@ -135,9 +189,14 @@ lazy_static! {
 
 // === Data types ===
 
+/// What the attendant sends to the client
 struct AttendantAnswer {
-	line :String,         // The line to send, MUST end with a newline!
-	end_connection :bool, // Should we close the connection
+	/** The line to send, It MUST end with a newline!
+
+	Use Self::new and Self::closed to create correct instances */
+	line :String,
+	/// If we should close the connection
+	end_connection :bool,
 }
 
 impl AttendantAnswer {
@@ -147,6 +206,7 @@ impl AttendantAnswer {
 		line.push_str("\n");
 		Self { line, end_connection: false }
 	}
+
 	/// Create a closing answer without trailing whitespace
 	pub fn closed (line :String) -> Self {
 		let mut line = line.trim_end_matches(util::ASCII_WS_AND_NL).to_string();
@@ -155,12 +215,15 @@ impl AttendantAnswer {
 	}
 }
 
+/// Identifier used to keep track of attendants
 pub(crate) type AttendantId = u32;
+/// Identifier used to keep track of both input and output filters
 type FilterId = u32;
 type AttendantInputFilters = Arc<Mutex<HashMap<FilterId, OurInputFilter>>>;
 type AttendantOutputFilters = Arc<Mutex<HashMap<FilterId, broadcast::Receiver<FilterOutput>>>>;
 type AttendantRequestIdGenerator = Arc<AtomicU32>;
-type NextFilterOutputFutOutput = (FilterId, Result<FilterOutput, broadcast::RecvError>);
+/// (dev) Item of impl Stream for Attendant::NextFilterOutput
+type NextFilterOutputItem = (FilterId, Result<FilterOutput, broadcast::RecvError>);
 
 /** An attendant that handles a single client connection
 
@@ -195,7 +258,7 @@ impl Attendant {
 			tx_req,
 			input_filters: Default::default(),
 			output_filters: Default::default(),
-			id: get_client_id(),
+			id: get_attendant_id(),
 			request_id_generator: Arc::new(AtomicU32::new(0)),
 		}
 	}
@@ -231,7 +294,6 @@ impl Attendant {
 				// Handle processor replies
 				Some(answer) = self.rx_reply.recv() => {
 					let reply = answer.line;
-
 
 					match writer.write_all(reply.as_bytes()).await {
 						Ok(_) => print!("{}➡️  {}", self.id, reply),
@@ -279,7 +341,7 @@ impl Attendant {
 
 	/** Returns a `impl Stream` of `(FilterId, <filter receiver output>` that never ends
 	(never returns `None`. */
-	fn next_filter_output (&self) -> impl Stream<Item = NextFilterOutputFutOutput> {
+	fn next_filter_output (&self) -> impl Stream<Item = NextFilterOutputItem> {
 		// cf. futures::future::select_all;
 		use broadcast::RecvError;
 
@@ -288,7 +350,7 @@ impl Attendant {
 		}
 
 		impl Stream for NextFilterOutput {
-			type Item = (FilterId, Result<FilterOutput, RecvError>);
+			type Item = (FilterId, Result<FilterOutput, RecvError>); // = NextFilterOutputItem
 
 			fn poll_next (self :Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 				let mut output_filters = tear! { self.output_filters.try_lock()
@@ -353,41 +415,45 @@ struct AttendantProcessor {
 impl AttendantProcessor {
 	/// Entry point. Handles a single command
 	async fn process_command(&mut self, line :&str) {
-		// Extract the first space-delimited word
-		let (command, rest) = match line.find(' ') {
-			Some(i) => (&line[..i], &line[i+1..]),
-			None => (line, ""),
-		};
+		// TODO test filter-start arguments
 
-		let answer = match command {
-			"ready" => {
-				match (&mut self.rx_ready).await {
-					Some(_) => Self::reply_ok(command, ""),
-					None => Self::reply_bail(command, "unknown server status"),
+		let answer :AttendantAnswer = match GET_HEADER_REGEX.captures(line) {
+			Some(cap) => {
+				let command = &cap[2];
+				let header = &cap[1];
+				let args = cap.get(3).map(|v| v.as_str()).unwrap_or("");
+				match command {
+					"ready" => {
+						match (&mut self.rx_ready).await {
+							Some(_) => Self::reply_ok(header, ""),
+							None => Self::reply_bail(header, "unknown server status"),
+						}
+					},
+					"slash" => {
+						if args.is_empty() {
+							Self::reply_err(header, "missing command")
+						} else {
+							let attendant_req = AttendantCommand::SendCommand(args.to_string());
+							match self.send_request(header, attendant_req).await {
+								Ok(_) => Self::reply_ok(header, ""),
+								Err(v) => v,
+							}
+						}
+					},
+					"get-line" => self.get_line(header, args).await,
+
+					"guard-begin"  => self.guard_begin(header, args).await,
+					"guard-renew"  => self.guard_renew(header, args).await,
+					"guard-end"    => self.guard_end(header, args).await,
+					"filter-start" => self.filter_start(header, args).await,
+					"filter-stop"  => self.filter_stop(header, args).await,
+
+					"cya" => Self::reply_bail(header, "success"),
+					// otherwise
+					x => Self::reply_err(x, "unknown command"),
 				}
 			},
-			"slash" => {
-				if rest.is_empty() {
-					Self::reply_err(command, "missing command")
-				} else {
-					let attendant_req = AttendantCommand::SendCommand(rest.to_string());
-					match self.send_request(command, attendant_req).await {
-						Ok(_) => Self::reply_ok(command, ""),
-						Err(v) => v,
-					}
-				}
-			},
-			"get-line" => self.get_line(rest).await,
-
-			"guard-begin"  => self.guard_begin(rest).await,
-			"guard-renew"  => self.guard_renew(rest).await,
-			"guard-end"    => self.guard_end(rest).await,
-			"filter-start" => self.filter_start(rest).await,
-			"filter-stop"  => self.filter_stop(rest).await,
-
-			"cya" => Self::reply_bail(command, "success"),
-			// otherwise
-			x => Self::reply_err(x, "unknown command"),
+			None => Self::reply_err("", "invalid request")
 		};
 
 		let _ = self.tx_reply.send(answer).await; // Ignore if receiver has dropped
@@ -395,12 +461,10 @@ impl AttendantProcessor {
 
 	// {{{ Subcommands
 
-	async fn get_line (&mut self, rest :&str) -> AttendantAnswer {
-		const COMMAND :&str = "get-line";
-
+	async fn get_line (&mut self, header :&str, rest :&str) -> AttendantAnswer {
 		// Parse arguments
-		let cap = tear! { Self::parse_arguments(COMMAND, &GET_LINE_REGEX, rest) };
-		let regex = tear! { Self::compile_regex(COMMAND, &cap[1]) };
+		let cap = tear! { Self::parse_arguments(header, &GET_LINE_REGEX, rest) };
+		let regex = tear! { Self::compile_regex(header, &cap[1]) };
 		let slash = cap[2].to_string();
 
 		// Send request
@@ -408,33 +472,32 @@ impl AttendantProcessor {
 			.count(Some(1)).fail(Some(64))
 			.build();
 		let command = AttendantCommand::GetLine(slash, filter);
-		tear! { self.send_request(COMMAND, command).await };
+		tear! { self.send_request(header, command).await };
 
 		// Wait for result
 		let line /* :impl Future<Output = Option<String>> */ = rx_line.recv().map(|v| {
-			v.ok() /* :Option<FilterOutput> */ .map(FilterOutput::take_line).flatten()
+			v.ok() /* :Option<FilterOutput> */ .and_then(FilterOutput::take_line)
 		});
-		let line = tear! { line.await => |_| Self::reply_err(COMMAND, "line not found") };
+		let line = tear! { line.await => |_| Self::reply_err(header, "line not found") };
 
 		// Return line to client
-		Self::reply_ok(COMMAND, line)
+		Self::reply_ok(header, line)
 	}
 
-	async fn guard_begin (&mut self, rest :&str) -> AttendantAnswer {
-		const COMMAND :&str = "guard-begin";
-
+	async fn guard_begin (&mut self, header :&str, rest :&str) -> AttendantAnswer {
 		// Parse arguments
-		let cap = tear! { Self::parse_arguments(COMMAND, &GUARD_BEGIN_REGEX, rest) };
-		let regex = tear! { Self::compile_regex(COMMAND, &cap[1]) };
+		let cap = tear! { Self::parse_arguments(header, &GUARD_BEGIN_REGEX, rest) };
+		let regex = tear! { Self::compile_regex(header, &cap[1]) };
 		let duration = Duration::from_secs(match cap.get(2) {
-			Some(s) => tear! { s.as_str().parse() => |_| Self::reply_err(COMMAND, "invalid duration") },
+			Some(s) => tear! { s.as_str().parse()
+				=> |_| Self::reply_err(header, "invalid duration") },
 			None => crate::GUARD_TIMEOUT_SECS,
 		});
 
 		// Send the request
 		let (filter, rx_expired) = self.new_input_filter(regex);
 		let command = AttendantCommand::StartGuard(filter.clone(), duration);
-		tear! { self.send_request(COMMAND, command).await };
+		tear! { self.send_request(header, command).await };
 
 		// Add to active filters after sending the request
 		let filter_id = self.track_input_filter(filter);
@@ -457,19 +520,17 @@ impl AttendantProcessor {
 		});
 
 		// Return id to client
-		Self::reply_ok(COMMAND, filter_id.to_string())
+		Self::reply_ok(header, filter_id.to_string())
 	}
 
-	async fn guard_renew (&mut self, rest :&str) -> AttendantAnswer {
-		const COMMAND :&str = "guard-renew";
-
+	async fn guard_renew (&mut self, header :&str, rest :&str) -> AttendantAnswer {
 		// Parse arguments
-		let cap = tear! { Self::parse_arguments(COMMAND, &GUARD_RENEW_REGEX, rest) };
+		let cap = tear! { Self::parse_arguments(header, &GUARD_RENEW_REGEX, rest) };
 		let raw_filter_id = &cap[1];
 		let filter_id :FilterId = tear! { raw_filter_id.parse()
-			=> |_| Self::reply_err(COMMAND, "invalid filter id") };
+			=> |_| Self::reply_err(header, "invalid filter id") };
 		let duration :Duration = Duration::from_secs(tear! { cap[2].parse()
-			=> |_| Self::reply_err(COMMAND, "invalid duration") });
+			=> |_| Self::reply_err(header, "invalid duration") });
 
 		// UNLOCK Check if the filter is still considered active
 		let input_filter :Option<OurInputFilter> = self.input_filters.lock().unwrap()
@@ -479,67 +540,61 @@ impl AttendantProcessor {
 		// Send request
 		if let Some(filter) = input_filter {
 			let command = AttendantCommand::RenewGuard(filter, duration);
-			tear! { self.send_request(COMMAND, command).await }
+			tear! { self.send_request(header, command).await }
 
-			Self::reply_ok(COMMAND, raw_filter_id)
+			Self::reply_ok(header, raw_filter_id)
 		} else {
-			Self::reply_err(COMMAND, "no such guard")
+			Self::reply_err(header, "no such guard")
 		}
 	}
 
-	async fn guard_end (&mut self, rest :&str) -> AttendantAnswer {
-		const COMMAND :&str = "guard-end";
-
+	async fn guard_end (&mut self, header :&str, rest :&str) -> AttendantAnswer {
 		// Parse arguments
-		let cap = tear! { Self::parse_arguments(COMMAND, &GUARD_END_REGEX, rest) };
+		let cap = tear! { Self::parse_arguments(header, &GUARD_END_REGEX, rest) };
 		let raw_filter_id = &cap[1];
 		let filter_id :FilterId = tear! { raw_filter_id.parse()
-			=> |_| Self::reply_err(COMMAND, "invalid filter id") };
+			=> |_| Self::reply_err(header, "invalid filter id") };
 
 		if self.remove_input_filter(filter_id) {
-			Self::reply_ok(COMMAND, raw_filter_id)
+			Self::reply_ok(header, raw_filter_id)
 		} else {
-			Self::reply_err(COMMAND, "no such guard")
+			Self::reply_err(header, "no such guard")
 		}
 	}
 
-	async fn filter_start (&mut self, rest :&str) -> AttendantAnswer {
-		const COMMAND :&str = "filter-start";
-
+	async fn filter_start (&mut self, header :&str, rest :&str) -> AttendantAnswer {
 		// Parse arguments
-		let cap = tear! { Self::parse_arguments(COMMAND, &FILTER_START_REGEX, rest) };
-		let regex = tear! { Self::compile_regex(COMMAND, &cap[1]) };
+		let cap = tear! { Self::parse_arguments(header, &FILTER_START_REGEX, rest) };
+		let regex = tear! { Self::compile_regex(header, &cap[1]) };
 		let ignore_chat = cap.name("ignore-chat").is_some();
-		let count = cap.name("count").map(|m| m.as_str().parse().ok()).flatten();
-		let fail = cap.name("fail").map(|m| m.as_str().parse().ok()).flatten();
+		let count = cap.name("count").and_then(|m| m.as_str().parse().ok());
+		let fail = cap.name("fail").and_then(|m| m.as_str().parse().ok());
 
 		// Send request
 		let (filter, filter_rx) = OutputFilter::new(regex)
 			.ignore_chat(ignore_chat).count(count).fail(fail)
 			.build();
 		let command = AttendantCommand::AddOutputFilter(filter);
-		tear! { self.send_request(COMMAND, command).await }
+		tear! { self.send_request(header, command).await }
 
 		// Add filter receiver to set
 		let filter_id = self.add_output_filter_rx(filter_rx);
 
 		// Return id to client
-		Self::reply_ok(COMMAND, filter_id.to_string())
+		Self::reply_ok(header, filter_id.to_string())
 	}
 
-	async fn filter_stop (&mut self, rest :&str) -> AttendantAnswer {
-		const COMMAND :&str = "filter-stop";
-
+	async fn filter_stop (&mut self, header :&str, rest :&str) -> AttendantAnswer {
 		// Parse arguments
-		let cap = tear! { Self::parse_arguments(COMMAND, &FILTER_STOP_REGEX, rest) };
+		let cap = tear! { Self::parse_arguments(header, &FILTER_STOP_REGEX, rest) };
 		let raw_filter_id = &cap[1];
 		let filter_id :FilterId = tear! { raw_filter_id.parse()
-			=> |_| Self::reply_err(COMMAND, "invalid filter id") };
+			=> |_| Self::reply_err(header, "invalid filter id") };
 
 		if self.remove_output_filter_rx(filter_id) {
-			Self::reply_ok(COMMAND, raw_filter_id)
+			Self::reply_ok(header, raw_filter_id)
 		} else {
-			Self::reply_err(COMMAND, "no such filter")
+			Self::reply_err(header, "no such filter")
 		}
 	}
 
