@@ -1,5 +1,9 @@
 # Notes
 
+## Status
+
+Now, call crate::console in crate::main and test what happens when some initialization messages fail
+
 ## Important
 
 - Input filters can create deadlocks if they are not allowed to expire.
@@ -16,29 +20,13 @@
 
 ## TODO
 
+- Add console history for clients
 - Send all output to a function because we're handling user input
+- Handle error gracefully when the server command is not found
+
+## Scratchpad
 
 scripting languages:
 - Python
-- JS
-- PHP
 - Perl
-- Ruby
-- Rust
 - Raku
-
-filter-output | ={ <n>,<n> =#<re>#= }= | <cmd>
-              | =#<re>#=               | 
-
-guard start ={ save-off =;= save-all }= ={ save-on =|= save-all }= save-on
-guard resume
-```
-// defaults to 30 seconds
-guard prevent =(60)= =#^save-#=
-slash save-off
-get-line =#^Saved the game$#= =(,)= save-all
-&do-backup
-// guard renew
-slash save-on
-guard done
-```

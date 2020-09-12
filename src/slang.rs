@@ -1,11 +1,14 @@
-//! Our slang
+/*! Our slang
+
+See source code for all the pub(crate) re-exports
+*/
 
 pub(crate) use tear::prelude::*;
 pub(crate) use tokio::prelude::*;
 pub(crate) use lazy_static::lazy_static;
 pub(crate) use tokio::select;
 
-pub(crate) use crate::util;
+pub(crate) use crate::{util, console};
 pub(crate) use tokio::sync::{mpsc, broadcast};
 
 pub(crate) use regex::Regex;

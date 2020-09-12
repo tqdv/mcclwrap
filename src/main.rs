@@ -1,6 +1,9 @@
+// No docs for any of the modules here because it's in their respective files :(
+
 #[macro_use] mod slang;
 mod ready;
 mod expiroset;
+mod console;
 mod secretary;
 mod minecraft;
 mod filters;
@@ -22,6 +25,7 @@ use std::future::Future;
 use tokio::net::UnixListener;
 use tokio::time::delay_for;
 
+/// main.rs error module
 mod error {
 	use thiserror::Error;
 
@@ -38,7 +42,7 @@ mod error {
 }
 use error::ProgramFailure;
 
-const _OUR_NAME :&str = "mcclwrap";
+const OUR_NAME :&str = "mcclwrap";
 const SOCKET_PATH :&str  = "test.sock";
 const GUARD_TIMEOUT_SECS :u64 = 15;     // How long an input guard lasts by default
 
@@ -47,33 +51,33 @@ const FORCE_SHUTDOWN_DELAY :Duration = Duration::from_millis(1000);
 
 // === Other listeners ===
 
-// TODO make it look better and handle tab completion
-fn handle_stdin	(mut tx_req :mpsc::Sender<AttendantRequest>) -> tokio::task::JoinHandle<()> {
-	use minecraft::AttendantCommand::SendCommand;
-
-	let client_id = secretary::get_attendant_id();
-	tokio::spawn(async move { 
-		let mut stdin = BufReader::new(io::stdin()).lines();
-		while let Some(line) = stdin.next().await {
-			let line = line.expect("io or unicode error");
-
-			let (tx, rx) = ready::channel();
-			let slash = util::strip_leading_ascii_hspace(&line).to_string();
-			let req = AttendantRequest {
-				client_id,
-				done: tx,
-				command: SendCommand(slash),
-			};
-
-			if let Err(_) = tx_req.send(req).await {
-				eprintln!("🎁 Minecraft console input isn't handled anymore");
-			}
-			if let None = rx.await {
-				eprintln!("🎁 Failed to process standard input command"); // FIXME ?
-			}
-		}
-	})
-}
+// // TODO make it look better and handle tab completion
+// fn handle_stdin	(mut tx_req :mpsc::Sender<AttendantRequest>) -> tokio::task::JoinHandle<()> {
+// 	use minecraft::AttendantCommand::SendCommand;
+//
+// 	let client_id = secretary::get_attendant_id();
+// 	tokio::spawn(async move {
+// 		let mut stdin = BufReader::new(io::stdin()).lines();
+// 		while let Some(line) = stdin.next().await {
+// 			let line = line.expect("io or unicode error");
+//
+// 			let (tx, rx) = ready::channel();
+// 			let slash = util::strip_leading_ascii_hspace(&line).to_string();
+// 			let req = AttendantRequest {
+// 				client_id,
+// 				done: tx,
+// 				command: SendCommand(slash),
+// 			};
+//
+// 			if let Err(_) = tx_req.send(req).await {
+// 				eprintln!("🎁 Minecraft console input isn't handled anymore");
+// 			}
+// 			if let None = rx.await {
+// 				eprintln!("🎁 Failed to process standard input command"); // FIXME ?
+// 			}
+// 		}
+// 	})
+// }
 
 // === Cleanup and Shutdown ===
 
@@ -210,7 +214,7 @@ async fn async_main () -> Result<(), error::ProgramFailure> {
 	let rx_sig = get_signal_channel(); // CHECK why is this here ?
 	let (tx_req, rx_ready, rx_closed) = handle_minecraft_io(mc_in, mc_out);
 	secretary::listen_on_socket(listener, rx_ready.clone(), tx_req.clone());
-	handle_stdin(tx_req);
+	console::Console::new(tx_req, rx_closed.clone()).handle_stdio();
 	
 	// TODO start timers
 
@@ -223,11 +227,11 @@ async fn async_main () -> Result<(), error::ProgramFailure> {
 		let mut interval = tokio::time::interval(Duration::from_secs(3));
 		loop {
 			interval.tick().await;
-			println!("DEBUG tick");
+			writeln!(console::out(), "DEBUG tick");
 		}
 	});
 	
-	println!("🎁 Initialization complete");
+	writeln!(console::out(), "🎁 Initialization complete");
 
 	// Block main thread until we're told to stop
 	handle_stop_signals(

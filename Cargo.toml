@@ -17,3 +17,4 @@ nix = "0.18"
 
 # Disable unicode because we don't need it
 regex = { version = "1.3", default-features = false, features = ["std", "perf"] }
+linefeed = "0.6"

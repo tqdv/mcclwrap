@@ -177,8 +177,6 @@ async fn handle_minecraft_output (
 	let (tx_console, rx_console) = broadcast::channel::<String>(16);
 	let (tx_raw_console, rx_raw_console) = broadcast::channel::<String>(16);
 
-	println!("Handle mc output");
-
 	let mut output = BufReader::new(output).lines();
 	while let Some(line) = output.next().await {
 		let line = {
@@ -193,7 +191,7 @@ async fn handle_minecraft_output (
 		// Print minecraft console to output
 		// NB: \x1B[m resets colouring at the end of the line.
 		//     Minecraft seems to always reenable the color on the next line
-		println!("💻 {}\x1B[m", line);
+		writeln!(console::out(), "💻 {}\x1B[m", line);
 		
 		// Chop of the timestamp for tx_console (but keep the leading ansi color escape)
 		let message = REMOVE_TIMESTAMP_REGEX.replace(&line, "$1");
